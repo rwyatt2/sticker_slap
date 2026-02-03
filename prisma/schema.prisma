@@ -1,0 +1,370 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearch", "postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_DATABASE_URL") // For migrations (bypasses connection pooler)
+  extensions = [pgcrypto, pg_trgm]
+}
+
+// ============================================================================
+// NEXTAUTH.JS MODELS
+// ============================================================================
+
+/// OAuth account linked to a user (Google, GitHub, etc.)
+model Account {
+  id                String  @id @default(cuid())
+  userId            String  @map("user_id")
+  type              String  // "oauth" | "oidc" | "email" | "credentials"
+  provider          String  // Provider name (google, github, etc.)
+  providerAccountId String  @map("provider_account_id")
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("accounts")
+}
+
+/// User session for authentication
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique @map("session_token")
+  userId       String   @map("user_id")
+  expires      DateTime
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expires])
+  @@map("sessions")
+}
+
+/// User account with authentication and profile data
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  name          String?
+  image         String?   // Profile image URL
+  emailVerified DateTime? @map("email_verified")
+  password      String?   // Hashed password for credentials auth (bcrypt/argon2)
+  role          UserRole  @default(USER)
+  isActive      Boolean   @default(true) @map("is_active")
+  lastLoginAt   DateTime? @map("last_login_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Upload quota tracking
+  uploadQuotaBytes   BigInt   @default(524288000) @map("upload_quota_bytes") // 500MB default
+  uploadUsedBytes    BigInt   @default(0) @map("upload_used_bytes")
+  uploadsThisHour    Int      @default(0) @map("uploads_this_hour")
+  uploadHourReset    DateTime @default(now()) @map("upload_hour_reset")
+
+  // Relations
+  accounts     Account[]
+  sessions     Session[]
+  projects     Project[]
+  stickers     Sticker[]
+  canvasViews  CanvasView[]
+  uploadJobs   UploadJob[]
+
+  @@index([email])
+  @@index([createdAt])
+  @@index([isActive])
+  @@map("users")
+}
+
+enum UserRole {
+  USER
+  ADMIN
+  MODERATOR
+}
+
+/// Email verification tokens for passwordless auth
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@index([expires])
+  @@map("verification_tokens")
+}
+
+/// Password reset tokens
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  email     String
+  token     String   @unique
+  expires   DateTime
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([email])
+  @@index([expires])
+  @@map("password_reset_tokens")
+}
+
+// ============================================================================
+// APPLICATION MODELS
+// ============================================================================
+
+/// Canvas project containing sticker placements
+model Project {
+  id          String   @id @default(cuid())
+  name        String
+  description String?  @db.Text
+  thumbnail   String?  // Thumbnail image URL
+  width       Int      @default(1920)
+  height      Int      @default(1080)
+  data        Json     @default("{}") // Canvas state as JSON (history, settings)
+  isPublic    Boolean  @default(false) @map("is_public")
+  isArchived  Boolean  @default(false) @map("is_archived")
+  userId      String   @map("user_id")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  user              User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  stickerPlacements StickerPlacement[]
+  canvasViews       CanvasView[]
+
+  @@index([userId])
+  @@index([isPublic])
+  @@index([isArchived])
+  @@index([createdAt(sort: Desc)])
+  @@index([userId, isArchived]) // Compound: user's active projects
+  @@map("projects")
+}
+
+/// Sticker asset in the library
+model Sticker {
+  id               String   @id @default(cuid())
+  userId           String?  @map("user_id") // Null for system stickers
+  name             String
+  imageUrl         String   @map("image_url") // Full-size image URL
+  thumbnailUrl     String   @map("thumbnail_url") // Thumbnail for performance
+  storageKey       String   @unique @map("storage_key") // S3/R2 object key
+  originalFilename String   @map("original_filename")
+  mimeType         String   @map("mime_type") // image/png, image/webp, etc.
+  fileSize         Int      @map("file_size") // Size in bytes
+  width            Int      // Original image width
+  height           Int      // Original image height
+  tags             String[] @default([])
+  categoryId       String?  @map("category_id")
+  isPublic         Boolean  @default(false) @map("is_public")
+
+  // Soft delete support
+  isDeleted Boolean   @default(false) @map("is_deleted")
+  deletedAt DateTime? @map("deleted_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  category   StickerCategory?   @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  user       User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
+  placements StickerPlacement[]
+
+  // Indexes for efficient queries
+  @@index([userId])
+  @@index([categoryId])
+  @@index([isPublic])
+  @@index([isDeleted])
+  @@index([createdAt(sort: Desc)])
+  @@index([mimeType])
+  @@index([tags], type: Gin) // GIN index for array search
+  @@index([userId, isDeleted]) // Compound: user's active stickers
+  @@index([isPublic, isDeleted]) // Compound: public active stickers
+  @@index([categoryId, isDeleted]) // Compound: category stickers
+  @@map("stickers")
+}
+
+/// Sticker placement on a canvas (position, transform, z-index)
+model StickerPlacement {
+  id        String @id @default(cuid())
+  projectId String @map("project_id")
+  stickerId String @map("sticker_id")
+
+  // Position (canvas coordinates)
+  positionX Float @default(0) @map("position_x")
+  positionY Float @default(0) @map("position_y")
+  zIndex    Int   @default(0) @map("z_index") // Layer ordering
+
+  // Dimensions (can differ from original sticker size)
+  width  Float
+  height Float
+
+  // Transform
+  rotation Float @default(0) // Degrees
+  scaleX   Float @default(1) @map("scale_x")
+  scaleY   Float @default(1) @map("scale_y")
+  opacity  Float @default(1)
+
+  // Visibility
+  isVisible Boolean @default(true) @map("is_visible")
+  isLocked  Boolean @default(false) @map("is_locked")
+
+  // Soft delete
+  isDeleted Boolean   @default(false) @map("is_deleted")
+  deletedAt DateTime? @map("deleted_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  sticker Sticker @relation(fields: [stickerId], references: [id], onDelete: Cascade)
+
+  // Indexes for spatial queries and efficient lookups
+  @@index([projectId])
+  @@index([stickerId])
+  @@index([zIndex])
+  @@index([isDeleted])
+  @@index([projectId, isDeleted]) // Compound: active placements in project
+  @@index([projectId, zIndex]) // Compound: layer ordering
+  @@index([positionX, positionY]) // Compound: spatial queries (basic)
+  @@index([projectId, positionX, positionY]) // Compound: project spatial queries
+  @@map("sticker_placements")
+}
+
+/// Sticker organization by category
+model StickerCategory {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  slug        String  @unique
+  description String? @db.Text
+  icon        String? // Icon name or URL
+  sortOrder   Int     @default(0) @map("sort_order")
+  isActive    Boolean @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  stickers Sticker[]
+
+  @@index([slug])
+  @@index([sortOrder])
+  @@index([isActive])
+  @@map("sticker_categories")
+}
+
+// ============================================================================
+// CANVAS VIEWPORT TRACKING (Performance Optimization)
+// ============================================================================
+
+/// Track user viewport positions for canvas performance optimization
+/// Used for lazy loading and culling off-screen elements
+model CanvasView {
+  id        String @id @default(cuid())
+  userId    String @map("user_id")
+  projectId String @map("project_id")
+
+  // Viewport bounds (what the user is currently viewing)
+  viewportX      Float @default(0) @map("viewport_x")
+  viewportY      Float @default(0) @map("viewport_y")
+  viewportWidth  Float @default(1920) @map("viewport_width")
+  viewportHeight Float @default(1080) @map("viewport_height")
+
+  // Zoom level
+  zoom Float @default(1)
+
+  // Last activity timestamp for cleanup
+  lastActiveAt DateTime @default(now()) @map("last_active_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  // Each user can only have one view per project
+  @@unique([userId, projectId])
+  @@index([projectId])
+  @@index([lastActiveAt])
+  @@map("canvas_views")
+}
+
+// ============================================================================
+// UPLOAD JOB TRACKING (Background Processing)
+// ============================================================================
+
+/// Track upload job status for background processing
+model UploadJob {
+  id            String         @id @default(cuid())
+  userId        String         @map("user_id")
+  status        UploadStatus   @default(PENDING)
+  originalName  String         @map("original_name")
+  tempKey       String?        @map("temp_key") // Temporary storage key
+  finalKey      String?        @map("final_key") // Final storage key after processing
+  fileSize      Int            @map("file_size")
+  mimeType      String         @map("mime_type")
+  errorMessage  String?        @map("error_message") @db.Text
+  metadata      Json?          // Additional metadata
+  progress      Int            @default(0) // 0-100
+  
+  // Scanning results
+  virusScanPassed  Boolean? @map("virus_scan_passed")
+  virusScanResult  String?  @map("virus_scan_result") @db.Text
+  
+  // Processing results
+  stickerId     String?        @map("sticker_id") // Created sticker ID
+  
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  completedAt   DateTime?      @map("completed_at")
+
+  // Relations
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt(sort: Desc)])
+  @@map("upload_jobs")
+}
+
+enum UploadStatus {
+  PENDING
+  UPLOADING
+  SCANNING
+  PROCESSING
+  COMPLETED
+  FAILED
+}
+
+// ============================================================================
+// AUDIT LOG (Row-Level Security Pattern Support)
+// ============================================================================
+
+/// Audit log for tracking changes to sensitive data
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?  @map("user_id") // Null for system actions
+  action     String   // CREATE, UPDATE, DELETE, SOFT_DELETE, RESTORE
+  entityType String   @map("entity_type") // User, Sticker, Project, etc.
+  entityId   String   @map("entity_id")
+  oldData    Json?    @map("old_data") // Previous state (for UPDATE/DELETE)
+  newData    Json?    @map("new_data") // New state (for CREATE/UPDATE)
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent") @db.Text
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)]) // Compound: user activity
+  @@map("audit_logs")
+}
